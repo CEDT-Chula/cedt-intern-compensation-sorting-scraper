@@ -201,7 +201,9 @@ async fn main() {
       .collect::<Vec<String>>(),
   ))
   .unwrap();
-  let mut df = df.drop("opening_id").unwrap();
+
+  let df = df.drop("opening_id").unwrap();
+  let mut df = df.head(Some(100));
 
   let mut buffer: Vec<u8> = vec![];
   let mut writer = JsonWriter::new(&mut buffer).with_json_format(polars::prelude::JsonFormat::Json);
