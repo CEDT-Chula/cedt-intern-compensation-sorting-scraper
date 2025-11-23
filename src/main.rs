@@ -4,10 +4,19 @@ use polars::prelude::{Column, IntoLazy};
 use polars::prelude::{JsonWriter, SerWriter, SortMultipleOptions};
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
+use std::io::{self, Write as _};
 use std::{fs, path::PathBuf};
 
-const OPENING_LISTING_URL: &str = "https://cedtintern.cp.eng.chula.ac.th/api/sessions/3/openings?search=&limit=20&onlyBookmarked=false&onlyAvailablePositions=false";
-const OPENING_URL: &str = "https://cedtintern.cp.eng.chula.ac.th/api/sessions/3/openings";
+fn get_opening_listing_url(semester: u32) -> String {
+  return format!("https://cedtintern.cp.eng.chula.ac.th/api/sessions/{}/openings?search=&limit=20&onlyBookmarked=false&onlyAvailablePositions=false",semester);
+}
+fn get_opening_url(semester: u32) -> String {
+  return format!(
+    "https://cedtintern.cp.eng.chula.ac.th/api/sessions/{}/openings",
+    semester
+  );
+}
+const FIRST_CEDT_YEAR: u32 = 2023;
 
 fn load_cookie() -> String {
   fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".cookie")).unwrap_or_else(
@@ -15,9 +24,15 @@ fn load_cookie() -> String {
   )
 }
 
-async fn get_opening_list(reqwest_client: &reqwest::Client, page: u32) -> String {
+async fn get_opening_list(reqwest_client: &reqwest::Client, page: u32, semester: u32) -> String {
+  let url = format!(
+      "{}&page={}",
+      get_opening_listing_url(semester),
+      page
+    );
+  println!("Fetching {}",url);
   let response = reqwest_client
-    .get(format!("{}&page={}", OPENING_LISTING_URL, page))
+    .get(url)
     .send()
     .await
     .expect(&format!("failed to get response to page {}", page))
@@ -43,30 +58,38 @@ fn read_response_to_json(content: &str) -> OpeningsListResponse {
   return serde_json::from_str(&content).unwrap();
 }
 
-async fn fetch_openings_ids(reqwest_client: &reqwest::Client, page: u32) -> Vec<u32> {
-  let response = get_opening_list(&reqwest_client, page).await;
+async fn fetch_openings_ids(
+  reqwest_client: &reqwest::Client,
+  page: u32,
+  semester: u32,
+) -> Vec<u32> {
+  let response = get_opening_list(&reqwest_client, page, semester).await;
   let response_json = read_response_to_json(&response);
   return get_opening_ids(&response_json);
 }
 
-async fn get_all_opening_ids(reqwest_client: &reqwest::Client) -> Vec<u32> {
-  let first_page = get_opening_list(&reqwest_client, 1).await;
+async fn get_all_opening_ids(reqwest_client: &reqwest::Client, semester: u32) -> Vec<u32> {
+  let first_page = get_opening_list(&reqwest_client, 1, semester).await;
   let first_page_json = read_response_to_json(&first_page);
 
   let mut opening_ids = get_opening_ids(&first_page_json);
 
   let mut tasks = vec![];
   for page in 2..=first_page_json.meta.total_page {
-    tasks.push(fetch_openings_ids(&reqwest_client, page));
+    tasks.push(fetch_openings_ids(&reqwest_client, page, semester));
   }
   opening_ids = [opening_ids, join_all(tasks).await.concat()].concat();
 
   return opening_ids;
 }
 
-async fn get_opening(reqwest_client: &reqwest::Client, opening_id: u32) -> OpeningResponse {
+async fn get_opening(
+  reqwest_client: &reqwest::Client,
+  opening_id: u32,
+  semester: u32,
+) -> OpeningResponse {
   let response = reqwest_client
-    .get(format!("{}/{}", OPENING_URL, opening_id))
+    .get(format!("{}/{}", get_opening_url(semester), opening_id))
     .send()
     .await
     .expect(&format!("failed to get response to page {}", opening_id))
@@ -86,36 +109,57 @@ async fn get_opening(reqwest_client: &reqwest::Client, opening_id: u32) -> Openi
 async fn get_opening_from_list(
   reqwest_client: &reqwest::Client,
   opening_ids: Vec<u32>,
+  semester: u32,
 ) -> Vec<OpeningResponse> {
   let mut tasks = vec![];
   for opening_id in opening_ids {
-    tasks.push(get_opening(reqwest_client, opening_id))
+    tasks.push(get_opening(reqwest_client, opening_id, semester))
   }
   let result = join_all(tasks).await;
   return result;
 }
 
-// macro_rules! array_of_field_from_struct {
-//   ($obj_array:ident, $prop:ident ) => {
-//     $obj_array.iter().map(|obj| obj.$prop).collect()
-//   };
-// }
+fn prepare_dataframe(openings: Vec<OpeningResponse>) -> DataFrame {
+  let mut companies_en: Vec<String> = vec![];
+  let mut companies_th: Vec<String> = vec![];
+  let mut job_titles: Vec<String> = vec![];
+  let mut descriptions: Vec<String> = vec![];
+  let mut opening_ids: Vec<u32> = vec![];
 
-macro_rules! array_of_struct_to_dataframe {
-  ($obj_array:ident, [$($prop:ident),*] ) => {
-    {let mut columns = vec![];
-    $(
-      columns.push(Column::new(
-        stringify!($prop).into(),
-        $obj_array.iter().map(|obj| obj.$prop.clone()).collect::<Vec<_>>(),
-      ));
-    )*
-    DataFrame::new(columns)}
-  };
+  for opening in openings {
+    companies_en.push(opening.company.company_name_en);
+    companies_th.push(opening.company.company_name_th);
+    job_titles.push(opening.title);
+    descriptions.push(opening.description.unwrap_or("-".into()));
+    opening_ids.push(opening.opening_id);
+  }
+
+  DataFrame::new(vec![
+    Column::new("company_en".into(), companies_en),
+    Column::new("company_th".into(), companies_th),
+    Column::new("job_title".into(), job_titles),
+    Column::new("description".into(), descriptions),
+    Column::new("opening_id".into(), opening_ids),
+  ])
+  .unwrap()
 }
 
 #[tokio::main]
 async fn main() {
+  let mut input = String::new();
+
+  print!("Please enter year: ");
+  io::stdout().flush().expect("Failed to flush stdout");
+  io::stdin()
+    .read_line(&mut input)
+    .expect("Failed to read line");
+
+  let year = input.trim().parse::<u32>().expect("Invalid year");
+
+  let semester: u32 = (year - FIRST_CEDT_YEAR) * 2 + 1;
+
+  println!("Fetching session/semester {}...",semester);
+
   let cookie = load_cookie();
 
   let mut headers = HeaderMap::new();
@@ -129,9 +173,9 @@ async fn main() {
     .build()
     .unwrap();
 
-  let opening_ids = get_all_opening_ids(&reqwest_client).await;
+  let opening_ids = get_all_opening_ids(&reqwest_client, semester).await;
 
-  let openings = get_opening_from_list(&reqwest_client, opening_ids).await;
+  let openings = get_opening_from_list(&reqwest_client, opening_ids, semester).await;
 
   let mut compensation_type = openings
     .iter()
@@ -159,7 +203,9 @@ async fn main() {
     }
   }
 
-  let mut df = array_of_struct_to_dataframe!(openings, [description, title, opening_id]).unwrap();
+  // let mut df = array_of_struct_to_dataframe!(openings, [description, title, opening_id]).unwrap();
+
+  let mut df = prepare_dataframe(openings);
 
   df.with_column(Column::new("compensation_type".into(), compensation_type))
     .unwrap();
@@ -194,8 +240,9 @@ async fn main() {
       .iter()
       .map(|opening_id| {
         format!(
-          "https://cedtintern.cp.eng.chula.ac.th/opening/{}/session/3",
-          opening_id.unwrap()
+          "https://cedtintern.cp.eng.chula.ac.th/opening/{}/session/{}",
+          opening_id.unwrap(),
+          semester
         )
       })
       .collect::<Vec<String>>(),
@@ -217,6 +264,8 @@ async fn main() {
     pretty_json,
   )
   .unwrap();
+
+  println!("Done! saved to {}",PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("result.json").display());
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -244,6 +293,13 @@ struct OpeningsListResponse {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct CompanyInfo {
+  company_name_th: String,
+  company_name_en: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct OpeningResponse {
   opening_id: u32,
   title: String,
@@ -251,6 +307,7 @@ struct OpeningResponse {
   compensation_amount: Option<u32>,
   compensation_type: Option<CompensationType>,
   working_condition: Option<String>,
+  company: CompanyInfo,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
