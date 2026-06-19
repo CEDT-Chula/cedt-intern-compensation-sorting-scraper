@@ -6,7 +6,7 @@ for CEDT01 in 2024: first 100 internships with most compensation amount(assuming
 
 # How to use?
 - copy http-only cookie named "athena_session" (for most browsers it should be at `dev tool(f12)>storage>cookies`) from cedtintern.cp.eng.chula.ac.th into project_directory/.cookie file
-  it should look like `athena_session:...`
+  it should look like `athena_session=...`
 - run `cargo run` in project directory
 - result will be in project_directory/result.json
 
